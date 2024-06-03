@@ -25,13 +25,12 @@ Both inviter and invite settings might be changed to be configurable per room, i
 
 `config.inviter` **must** be based on your homeserver and be able to invite people into the configured room.
 
-`config.filter` is the LDAP filter used to check for membership and will require both `{username}` (=localpart of registered user) and `{group}` (=`config.room_mapping.<group>`) to be present.
+`config.base` is the LDAP base.
+
 If the query yields one result, the user is considered to be in the group.
-The default would be the equivalent of `ldapsearch -b "<config.room_mapping.<group>.base>" "(&(cn={group})(memberUid={username}))"`
+The default would be the equivalent of `ldapsearch -b "<config.base>" "(room_mapping.<group>.filters)"`
 You will likely have to change this for your setup. See `_check_membership` in source for specifics.
 
-I'm looking into somehow making `config.room_mapping` changeable during runtime.
-Perhaps its own yaml config or even DB backend to allow for integration in some admin web frontend.
 
 ```yaml
 modules:
@@ -42,11 +41,11 @@ modules:
       start_tls: false
       bind_dn: "uid=matrix,ou=local,dc=example,dc=com"
       bind_password: "bind_pw"
-      filter: "(&(cn={group})(memberUid={username}))"
+      base: "DC=example,DC=com"
       inviter: "@admin:example.com"
       room_mapping:
         big-boss:
-          base: "ou=groups,dc=example,dc=com"
+          filters: "(&(objectClass=user)(sAMAccountName={username})(memberof=CN={group},OU=biggroup,{base}"
           roomids:
             - "!HQXHtWbrXbkldqluli:example.com"
         admin:
@@ -62,10 +61,12 @@ modules:
 ```
 
 ## Credits
+
+Originaly from https://git.uni-jena.de/ko27per/synapse-ldap-rules
+
 I borrowed code and/or took inspiration from:
 
 https://github.com/almightybob/matrix-synapse-rest-password-provider
 
 https://github.com/matrix-org/matrix-synapse-ldap3/tree/rei/sma_wrapper
 
-# synapse-ldap-mapping
