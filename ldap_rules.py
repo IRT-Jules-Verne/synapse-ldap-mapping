@@ -24,6 +24,7 @@ import synapse
 from pkg_resources import parse_version
 from synapse.api.errors import SynapseError, ShadowBanError
 from synapse.module_api import ModuleApi
+from synapse.types import UserID, RoomAlias
 from twisted.internet import threads
 
 __version__ = "0.0.2"
@@ -181,10 +182,11 @@ class LdapRules:
         Args:
             username: The users login.
             ldap_group: LDAP group to check for username.
-            ldap_base: LDAP base of group
+            ldap_filter: LDAP filter search of the group the username must be memberof
+            using ldap_base for the search
 
         Returns True
-            if username was found in group
+            if username was found in the group
         Returns False
             if username was not found in group or bind failed
         """
@@ -287,6 +289,39 @@ class LdapRules:
             logger.info("Joined user '%s' into room '%s'", target, roomid)
         return joined
 
+    async def _room_exists(self, room_name):
+        try:
+            if room_name.startswith("#") and ":" in room_name:            
+                room_alias_obj = RoomAlias(room_name, self.hs.hostname )
+                room_id = self.api_handler.get_room_id(room_alias_obj.to_string())
+            else:
+                print(f"Invalid room alias: '{room_name}'")
+                return None
+            return room_id is not None
+        except Exception as e:
+            print(f"Failed to check room '{room_name}': {e}")
+
+
+    async def _create_room(self, user_id, room_name):
+        room_creation_params = {
+            "preset": "private_chat",
+            "room_alias_name": room_name,
+            "name": room_name,
+            "visibility": "private"
+        }
+       
+        try:
+            room_id = self.api_handler.create_room(
+                user_id=user_id,
+                room_alias_name=room_name,
+                name=room_name,
+                preset="private_chat",
+                visibility="private"
+            )
+            print(f"Room '{room_name}' created successfully with ID {room_id}.")
+        except Exception as e:
+            print(f"Failed to create room '{room_name}': {e}")
+
     async def on_register(self, username: str, auth_provider_type: str, auth_provider_id: str):
         # username from callback will be fully qualified
         localpart = username.split(":", 1)[0][1:]
@@ -303,7 +338,7 @@ class LdapRules:
                 "check whether '%s' exists in group",
                 group,
                 localpart,
-            )
+            )           
             # Check whether user is in group ...
             if await self._check_membership(localpart, group, filter):
                 logging.debug(
@@ -315,6 +350,12 @@ class LdapRules:
 
                 # ... on success we can iterate through rooms to join
                 for roomid in roomids:
+                    # Check if room exist
+                    roomid = self._check_room_exist(roomid):
+                    if await 
+                    # Create the room if it doesn't exist
+                        await self._create_room(self,self.inviter,roomid)
+
                     # Finally join or invite user to room
                     await self._join_to_room(self.inviter, username, roomid, invite)
 
@@ -327,3 +368,5 @@ def _require_keys(config: Dict[str, Any], required: Iterable[str]) -> None:
                 ", ".join(missing),
             )
         )
+
+
