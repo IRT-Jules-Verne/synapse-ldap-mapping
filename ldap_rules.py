@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2022 Johannes H.
+# Modifications 2024 IRT Jules Verne
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 import ssl
 from dataclasses import dataclass
@@ -10,7 +24,7 @@ import synapse
 from pkg_resources import parse_version
 from synapse.api.errors import SynapseError, ShadowBanError
 from synapse.module_api import ModuleApi
-from synapse.types import UserID, RoomAlias
+from synapse.types import RoomAlias
 from twisted.internet import threads
 
 __version__ = "0.0.3"
@@ -33,7 +47,7 @@ class LdapRules:
 
     def __init__(self, config: _Config, api: ModuleApi):
         self.api_handler = api
-        synapse_min_version = "1.46.0"  # Introduces ModuleApi.update_room_membership
+        synapse_min_version = "1.46.0"
 
         if parse_version(synapse.__version__) < parse_version(synapse_min_version):
             raise Exception(f"Running Synapse version {synapse.__version__}, {synapse_min_version} required.")
@@ -46,20 +60,16 @@ class LdapRules:
         self.inviter = config.inviter
         self.room_mapping = config.room_mapping
 
+        # Ensure 'invite' key is present in room mappings
+        for group, mapping in self.room_mapping.items():
+            mapping.setdefault("invite", False)
+
         # Module callback for Synapse
         api.register_account_validity_callbacks(on_user_login=self.on_register)
 
     @staticmethod
     def parse_config(config) -> _Config:
         _require_keys(config, ["uri", "bind_dn", "bind_password", "base", "inviter", "room_mapping"])
-        room_mapping = config["room_mapping"]
-
-        # Ensure 'invite' key is present in room mappings
-        for group, mapping in room_mapping.items():
-            if "invite" not in mapping:
-                # TODO: Check this per room, not per group?
-                mapping["invite"] = False
-
         return _Config(
             enabled=config.get("enabled", False),
             uri=config["uri"],
@@ -68,7 +78,7 @@ class LdapRules:
             bind_password=config["bind_password"],
             base=config["base"],
             inviter=config["inviter"],
-            room_mapping=room_mapping,
+            room_mapping=config["room_mapping"],
         )
 
     def _get_server(self, get_info: Optional[str] = None) -> ldap3.ServerPool:
@@ -78,9 +88,7 @@ class LdapRules:
     async def _ldap_simple_bind(self, server: ldap3.ServerPool, bind_dn: str, password: str) -> Tuple[bool, Optional[ldap3.Connection]]:
         """Attempt a simple bind with the credentials given against the LDAP server."""
         try:
-            conn = await threads.deferToThread(
-                ldap3.Connection, server, bind_dn, password, authentication=ldap3.SIMPLE, read_only=True
-            )
+            conn = await threads.deferToThread(ldap3.Connection, server, bind_dn, password, authentication=ldap3.SIMPLE, read_only=True)
             logger.debug("Established LDAP connection in simple bind mode: %s", conn)
 
             if self.ldap_start_tls:
@@ -100,30 +108,14 @@ class LdapRules:
             logger.warning("Error during LDAP authentication: %s", e)
             return False, None
 
-    async def _check_membership(self, username: str, ldap_group: str, ldap_filter: str) -> bool:
+    async def _check_membership(self, conn: ldap3.Connection, username: str, ldap_group: str, ldap_filter: str) -> bool:
         """Checks whether a group contains a user."""
-        server = self._get_server()
         query = ldap_filter.format(username=username, group=ldap_group)
-
-        result, conn = await self._ldap_simple_bind(server, self.ldap_bind_dn, self.ldap_bind_password)
-
-        if not result:
-            return False
 
         await threads.deferToThread(conn.search, search_base=self.ldap_base, search_filter=query)
         responses = [response for response in conn.response if response["type"] == "searchResEntry"]
 
-        await threads.deferToThread(conn.unbind)
-
-        if len(responses) == 1:
-            logger.info("LDAP search found match for user '%s' in group '%s'", username, ldap_group)
-            return True
-
-        logger.info(
-            "LDAP search returned %s results for '%s' in group '%s'",
-            "no" if len(responses) == 0 else "too many", username, ldap_group
-        )
-        return False
+        return len(responses) == 1
 
     async def _join_to_room(self, sender: str, target: str, roomid: str, invite: Optional[bool] = False) -> bool:
         """Tries to force-join a user into a room."""
@@ -175,22 +167,27 @@ class LdapRules:
         localpart = username.split(":", 1)[0][1:]
         logger.debug("'%s' just got registered, localpart '%s'", username, localpart)
 
+        server = self._get_server()
+        result, conn = await self._ldap_simple_bind(server, self.ldap_bind_dn, self.ldap_bind_password)
+
+        if not result:
+            logger.warning("LDAP bind failed for user '%s'", username)
+            return
+
         for group, mapping in self.room_mapping.items():
             invite = mapping["invite"]
-            #invite = mapping.get("invite", False)
             filter = mapping["filter"]
             room_names = mapping["room_names"]
 
-            logger.debug("Checking group '%s' for user '%s'", group, localpart)
-            if await self._check_membership(localpart, group, filter):
-                logger.debug("User '%s' found in group '%s', rooms to join: %s", localpart, group, room_names)
-
+            if await self._check_membership(conn, localpart, group, filter):
                 for room_name in room_names:
                     room_id = await self._check_room_exist(room_name)
                     if room_id is None:
                         room_id = await self._create_the_room(room_name)
                     if room_id:
                         await self._join_to_room(self.inviter, username, room_id, invite)
+
+        await threads.deferToThread(conn.unbind)
 
 def _require_keys(config: Dict[str, Any], required: Iterable[str]) -> None:
     missing = [key for key in required if key not in config]
