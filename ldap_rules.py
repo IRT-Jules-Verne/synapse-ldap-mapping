@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import ssl
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ from synapse.module_api import ModuleApi
 from synapse.types import UserID, RoomAlias
 from twisted.internet import threads
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +229,7 @@ class LdapRules:
                 logger.info(
                     "LDAP search returned no results for '%s' in group '%s'", username, ldap_group)
             else:
-                logger.info(
+                logger.warning(
                     "LDAP search returned too many (%s) results for '%s'",
                     len(responses),
                     query,
@@ -239,9 +238,7 @@ class LdapRules:
             await threads.deferToThread(conn.unbind)
             return False
 
-    async def _join_to_room(
-        self, sender: str, target: str, roomid: str, invite: Optional[bool] = False
-    ) -> bool:
+    async def _join_to_room(self, sender: str, target: str, roomid: str, invite: Optional[bool] = False) -> bool:
         """Tries to force-join a user into a room.
 
         Args:
@@ -289,38 +286,49 @@ class LdapRules:
             logger.info("Joined user '%s' into room '%s'", target, roomid)
         return joined
 
-    async def _room_exists(self, room_name):
+    async def _check_room_exist(self, room_name) -> bool:
+        """Check if a room exist using the Alias
+            Args:
+                room_name: The alias of the room.
+        """
         try:
-            if room_name.startswith("#") and ":" in room_name:            
-                room_alias_obj = RoomAlias(room_name, self.hs.hostname )
-                room_id = self.api_handler.get_room_id(room_alias_obj.to_string())
+            if  "!" not in room_name:            
+                logger.info("Search room '%s'", room_name)
+                room_alias_obj = RoomAlias(room_name, self.api_handler.server_name )
+                logger.info("Search object room alias'%s'", room_alias_obj)
+                room_id = await self.api_handler.lookup_room_alias(room_alias_obj.to_string())
+                if room_id is not None:
+                    logger.info("FIND room '%s'", room_name)
+                    return room_id[0]
             else:
-                print(f"Invalid room alias: '{room_name}'")
-                return None
-            return room_id is not None
+                raise Exception("Invalid room alias: '%s'", room_name )
+        except SynapseError:
+            logger.info("Room '%s' not found, we must create it", room_alias_obj)
+            return None
         except Exception as e:
-            print(f"Failed to check room '{room_name}': {e}")
+            logger.exception("Failed to check room '%s': '%s'", room_name, e)
+            return None
 
 
-    async def _create_room(self, user_id, room_name):
+    async def _create_the_room(self, room_name) -> str:
+        """Check if a room exist using the Alias
+            Args:
+                room_name: The alias of the room
+                inviter: from self.inveter, is the one creating the room
+        """
         room_creation_params = {
             "preset": "private_chat",
             "room_alias_name": room_name,
             "name": room_name,
             "visibility": "private"
         }
-       
+        logger.info("Create room '%s' by '%s'", room_name, self.inviter)
         try:
-            room_id = self.api_handler.create_room(
-                user_id=user_id,
-                room_alias_name=room_name,
-                name=room_name,
-                preset="private_chat",
-                visibility="private"
-            )
-            print(f"Room '{room_name}' created successfully with ID {room_id}.")
+            room_id = self.api_handler.create_room(self.inviter,room_creation_params)
+            logger.info("Room '%s' created successfully: %s", room_name, room_id[0])
+            return room_id[0]
         except Exception as e:
-            print(f"Failed to create room '{room_name}': {e}")
+            logger.exception("Failed to create room '%s': %s", room_name, e)
 
     async def on_register(self, username: str, auth_provider_type: str, auth_provider_id: str):
         # username from callback will be fully qualified
@@ -331,7 +339,7 @@ class LdapRules:
         for group, mapping in self.room_mapping.items():
             invite = mapping["invite"]
             filter = mapping["filter"]
-            roomids = mapping["roomids"]
+            room_names = mapping["room_names"]
 
             logging.debug(
                 "Entering room_mapping for group '%s' and "
@@ -345,19 +353,19 @@ class LdapRules:
                     "User '%s' found in group '%s', rooms to join: %s",
                     localpart,
                     group,
-                    roomids,
+                    room_names,
                 )
 
                 # ... on success we can iterate through rooms to join
-                for roomid in roomids:
+                for room_name in room_names:
                     # Check if room exist
-                    roomid = self._check_room_exist(roomid):
-                    if await 
-                    # Create the room if it doesn't exist
-                        await self._create_room(self,self.inviter,roomid)
+                    room_id = await self._check_room_exist(room_name) 
+                    if room_id is None:
+                        # Create the room if it doesn't exist
+                            await self._create_the_room(room_name)
 
                     # Finally join or invite user to room
-                    await self._join_to_room(self.inviter, username, roomid, invite)
+                    await self._join_to_room(self.inviter, username, room_id, invite)
 
 
 def _require_keys(config: Dict[str, Any], required: Iterable[str]) -> None:
@@ -368,5 +376,3 @@ def _require_keys(config: Dict[str, Any], required: Iterable[str]) -> None:
                 ", ".join(missing),
             )
         )
-
-
