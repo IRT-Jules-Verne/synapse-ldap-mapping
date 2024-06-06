@@ -1,0 +1,7 @@
+---
+
+- name: Ensure matrix_ldap_mapping doesn't exist
+  ansible.builtin.file:
+    path: "{{ matrix_synapse_ext_path }}/ldap_rules.py"
+    state: absent
+

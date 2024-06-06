@@ -47,7 +47,7 @@ class LdapRules:
 
     def __init__(self, config: _Config, api: ModuleApi):
         self.api_handler = api
-        synapse_min_version = "1.46.0"
+        synapse_min_version = "1.46.0" # Introduces ModuleApi.update_room_membership
 
         if parse_version(synapse.__version__) < parse_version(synapse_min_version):
             raise Exception(f"Running Synapse version {synapse.__version__}, {synapse_min_version} required.")
@@ -60,8 +60,9 @@ class LdapRules:
         self.inviter = config.inviter
         self.room_mapping = config.room_mapping
 
-        # Ensure 'invite' key is present in room mappings
+        # Ensure 'invite' key is present in room mappings, making invite key optional
         for group, mapping in self.room_mapping.items():
+            # TODO: Check this per room, not per group?
             mapping.setdefault("invite", False)
 
         # Module callback for Synapse
@@ -69,6 +70,7 @@ class LdapRules:
 
     @staticmethod
     def parse_config(config) -> _Config:
+        # verify config sanity
         _require_keys(config, ["uri", "bind_dn", "bind_password", "base", "inviter", "room_mapping"])
         return _Config(
             enabled=config.get("enabled", False),
@@ -82,11 +84,27 @@ class LdapRules:
         )
 
     def _get_server(self, get_info: Optional[str] = None) -> ldap3.ServerPool:
-        """Constructs ServerPool from configured LDAP URIs"""
+        """Constructs ServerPool from configured LDAP URIs
+
+        Args:
+            get_info: specifies if the server schema and server
+            specific info must be read. Defaults to None.
+
+        Returns:
+            Servers grouped in a ServerPool
+        """
         return ldap3.ServerPool([ldap3.Server(uri, get_info=get_info, tls=self._ldap_tls) for uri in self.ldap_uris])
 
     async def _ldap_simple_bind(self, server: ldap3.ServerPool, bind_dn: str, password: str) -> Tuple[bool, Optional[ldap3.Connection]]:
-        """Attempt a simple bind with the credentials given against the LDAP server."""
+        """Attempt a simple bind with the credentials given against
+        the LDAP server.
+
+        Returns True, LDAP3Connection
+            if the bind was successful
+        Returns False, None
+            if an error occured
+        """
+
         try:
             conn = await threads.deferToThread(ldap3.Connection, server, bind_dn, password, authentication=ldap3.SIMPLE, read_only=True)
             logger.debug("Established LDAP connection in simple bind mode: %s", conn)
@@ -109,7 +127,22 @@ class LdapRules:
             return False, None
 
     async def _check_membership(self, conn: ldap3.Connection, username: str, ldap_group: str, ldap_filter: str) -> bool:
-        """Checks whether a group contains a user."""
+        """Checks whether a group contains a user. This could technically be
+        any property of the group. We provide group properties that resolve to
+        users, because OpenLDAP does not support LDAP_MATCHING_RULE_IN_CHAIN.
+        You will most likely have to modify this for your installation.
+
+        Args:
+            username: The users login.
+            ldap_group: LDAP group to check for username.
+            ldap_base: LDAP base of group
+
+        Returns True
+            if username was found in group
+        Returns False
+            if username was not found in group or bind failed
+        """
+
         query = ldap_filter.format(username=username, group=ldap_group)
 
         await threads.deferToThread(conn.search, search_base=self.ldap_base, search_filter=query)
@@ -118,7 +151,20 @@ class LdapRules:
         return len(responses) == 1
 
     async def _join_to_room(self, sender: str, target: str, roomid: str, invite: Optional[bool] = False) -> bool:
-        """Tries to force-join a user into a room."""
+        """Tries to force-join a user into a room.
+
+        Args:
+            sender: Inviters mxid, must be local
+            target: Invitees mxid, must be local
+            roomid: The roomid to join
+            invite: If True, only invite
+
+        Returns True
+            if join or invite was successful
+        Returns False
+            if join or invite failed
+        """
+
         try:
             await self.api_handler.update_room_membership(sender, target, roomid, "invite")
             if not invite:
@@ -164,6 +210,7 @@ class LdapRules:
             return None
 
     async def on_register(self, username: str, auth_provider_type: str, auth_provider_id: str):
+        # username from callback will be fully qualified        
         localpart = username.split(":", 1)[0][1:]
         logger.debug("'%s' just got registered, localpart '%s'", username, localpart)
 
@@ -178,8 +225,9 @@ class LdapRules:
             invite = mapping["invite"]
             filter = mapping["filter"]
             room_names = mapping["room_names"]
-
+            # Check whether user is in group ...
             if await self._check_membership(conn, localpart, group, filter):
+                # ... on success we can iterate through rooms to join                
                 for room_name in room_names:
                     room_id = await self._check_room_exist(room_name)
                     if room_id is None:

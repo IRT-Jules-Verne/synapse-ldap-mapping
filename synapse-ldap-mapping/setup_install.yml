@@ -1,0 +1,42 @@
+---
+- name: Download matrix_synapse_ldap_mapping
+  ansible.builtin.get_url:
+    url: "{{ matrix_synapse_ext_synapse_ldap_mapping_download_uri }}"
+    dest: "{{ matrix_synapse_ext_path }}/ldap_rules.py"
+    force: true
+    mode: 0440
+    owner: "{{ matrix_synapse_uid }}"
+    group: "{{ matrix_synapse_gid }}"
+  register: result
+  retries: "{{ devture_playbook_help_geturl_retries_count }}"
+  delay: "{{ devture_playbook_help_geturl_retries_delay }}"
+  until: result is not failed
+
+- ansible.builtin.set_fact:
+    matrix_synapse_modules: >
+      {{
+        matrix_synapse_modules
+        +
+        [{
+          "module": "ldap_rules.LdapRules",
+          "config": {
+            "uri": "{{ matrix_synapse_ext_synapse_ldap_mapping_uri }}",
+            "start_tls": "{{ matrix_synapse_ext_synapse_ldap_mapping_uri }}",
+            "bind_dn": "{{ matrix_synapse_ext_synapse_ldap_mapping_bind_dn }}",
+            "bind_password": "{{ matrix_synapse_ext_synapse_ldap_mapping_bind_password }}",
+            "base": "{{ matrix_synapse_ext_synapse_ldap_mapping_base }}",
+            "inviter": "{{ matrix_synapse_ext_synapse_ldap_mapping_inviter }}",
+            "room_mapping": matrix_synapse_ext_synapse_ldap_mapping_room_mapping            
+            },
+          },
+        }]
+      }}
+
+    matrix_synapse_container_extra_arguments: >
+      {{
+        matrix_synapse_container_extra_arguments | default([])
+        +
+        ["--mount type=bind,src={{ matrix_synapse_ext_path }}/ldap_rules.py,dst={{ matrix_synapse_in_container_python_packages_path }}/ldap_rules.py,ro"]
+      }}
+
+
