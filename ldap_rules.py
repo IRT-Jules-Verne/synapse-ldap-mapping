@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import ldap3
 import ldap3.core.exceptions
 import synapse
-from pkg_resources import parse_version
+from packaging.version import parse
 from synapse.api.errors import SynapseError, ShadowBanError
 from synapse.module_api import ModuleApi
 from synapse.types import RoomAlias
@@ -49,9 +49,9 @@ class LdapRules:
         self.api_handler = api
         synapse_min_version = "1.46.0" # Introduces ModuleApi.update_room_membership
 
-        if parse_version(synapse.__version__) < parse_version(synapse_min_version):
+        if parse(synapse.__version__) < parse(synapse_min_version):
             raise Exception(f"Running Synapse version {synapse.__version__}, {synapse_min_version} required.")
-
+            
         self.ldap_uris = [config.uri] if isinstance(config.uri, str) else config.uri
         self.ldap_start_tls = config.start_tls
         self.ldap_bind_dn = config.bind_dn
