@@ -27,7 +27,7 @@ from synapse.module_api import ModuleApi
 from synapse.types import RoomAlias
 from twisted.internet import threads
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,10 @@ class LdapRules:
         Returns:
             Servers grouped in a ServerPool
         """
-        return ldap3.ServerPool([ldap3.Server(uri, get_info=get_info, tls=self._ldap_tls) for uri in self.ldap_uris])
+        return ldap3.ServerPool([
+            ldap3.Server(uri, get_info=get_info, tls=self._ldap_tls)
+            for uri in self.ldap_uris
+            ])
 
     async def _ldap_simple_bind(self, server: ldap3.ServerPool, bind_dn: str, password: str) -> Tuple[bool, Optional[ldap3.Connection]]:
         """Attempt a simple bind with the credentials given against
@@ -150,6 +153,26 @@ class LdapRules:
 
         return len(responses) == 1
 
+
+
+    async def _is_user_in_room(self, user_id: str, room_id: str) -> bool:
+        """Check if a local user is currently joined to a room.
+
+        Uses the internal store directly since ModuleApi does not expose
+        a membership check method. Returns True if the user's current
+        membership is "join".
+        """
+        try:
+            membership, _ = await self.api_handler._store.get_local_current_membership_for_user_in_room(
+                user_id=user_id, room_id=room_id
+            )
+            return membership == "join"
+        except Exception as e:
+            logger.warning("Could not check membership of '%s' in '%s': %s", user_id, room_id, e)
+            return False
+
+
+
     async def _join_to_room(self, sender: str, target: str, roomid: str, invite: Optional[bool] = False) -> bool:
         """Tries to force-join a user into a room.
 
@@ -165,15 +188,28 @@ class LdapRules:
             if join or invite failed
         """
 
+        #Check if already in room
+        if not invite and await self._is_user_in_room(target, roomid):
+            logger.debug("User '%s' is already in room '%s', skipping.", target, roomid)
+            return True
+
         try:
             await self.api_handler.update_room_membership(sender, target, roomid, "invite")
             if not invite:
                 await self.api_handler.update_room_membership(target, target, roomid, "join")
             logger.info("Joined user '%s' into room '%s'", target, roomid)
             return True
-        except (RuntimeError, ShadowBanError, SynapseError) as e:
-            logger.exception("Error occurred when trying to join '%s' into '%s': %s", target, roomid, e)
+        except SynapseError as e:
+            if e.code == 403 and "already in the room" in str(e):
+                # Race condition: user joined between our check and the invite
+                logger.debug("User '%s' joined room '%s' concurrently, skipping.", target, roomid)
+                return True
+            logger.exception("Error joining '%s' into '%s': %s", target, roomid, e)
             return False
+        except (RuntimeError, ShadowBanError) as e:
+            logger.exception("Error joining '%s' into '%s': %s", target, roomid, e)
+            return False           
+
 
     async def _check_room_exist(self, room_name: str) -> Optional[str]:
         """Check if a room exists using the alias."""
