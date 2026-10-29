@@ -25,11 +25,13 @@ from packaging.version import parse
 from synapse.api.errors import SynapseError, ShadowBanError
 from synapse.module_api import ModuleApi
 from synapse.types import RoomAlias
-from twisted.internet import threads
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 logger = logging.getLogger(__name__)
+
+LDAP_CONNECT_TIMEOUT = 5  # seconds
+LDAP_RECEIVE_TIMEOUT = 10  # seconds
 
 @dataclass
 class _Config:
@@ -93,10 +95,12 @@ class LdapRules:
         Returns:
             Servers grouped in a ServerPool
         """
+        # active=1/exhaust=True: try each server once instead of looping forever
+        # when none is reachable (ldap3 default), which hangs the caller.
         return ldap3.ServerPool([
-            ldap3.Server(uri, get_info=get_info, tls=self._ldap_tls)
+            ldap3.Server(uri, get_info=get_info, tls=self._ldap_tls, connect_timeout=LDAP_CONNECT_TIMEOUT)
             for uri in self.ldap_uris
-            ])
+            ], active=1, exhaust=True)
 
     async def _ldap_simple_bind(self, server: ldap3.ServerPool, bind_dn: str, password: str) -> Tuple[bool, Optional[ldap3.Connection]]:
         """Attempt a simple bind with the credentials given against
@@ -109,20 +113,20 @@ class LdapRules:
         """
 
         try:
-            conn = await threads.deferToThread(ldap3.Connection, server, bind_dn, password, authentication=ldap3.SIMPLE, read_only=True)
+            conn = await self.api_handler.defer_to_thread(ldap3.Connection, server, bind_dn, password, authentication=ldap3.SIMPLE, read_only=True, receive_timeout=LDAP_RECEIVE_TIMEOUT)
             logger.debug("Established LDAP connection in simple bind mode: %s", conn)
 
             if self.ldap_start_tls:
-                await threads.deferToThread(conn.open)
-                await threads.deferToThread(conn.start_tls)
+                await self.api_handler.defer_to_thread(conn.open)
+                await self.api_handler.defer_to_thread(conn.start_tls)
                 logger.debug("Upgraded LDAP connection in simple bind mode through StartTLS: %s", conn)
 
-            if await threads.deferToThread(conn.bind):
+            if await self.api_handler.defer_to_thread(conn.bind):
                 logger.debug("LDAP Bind successful in simple bind mode.")
                 return True, conn
 
             logger.info("Binding against LDAP failed for '%s': %s", bind_dn, conn.result["description"])
-            await threads.deferToThread(conn.unbind)
+            await self.api_handler.defer_to_thread(conn.unbind)
             return False, None
 
         except ldap3.core.exceptions.LDAPException as e:
@@ -148,7 +152,7 @@ class LdapRules:
 
         query = ldap_filter.format(username=username, group=ldap_group)
 
-        await threads.deferToThread(conn.search, search_base=self.ldap_base, search_filter=query)
+        await self.api_handler.defer_to_thread(conn.search, search_base=self.ldap_base, search_filter=query)
         responses = [response for response in conn.response if response["type"] == "searchResEntry"]
 
         return len(responses) == 1
@@ -246,9 +250,16 @@ class LdapRules:
             return None
 
     async def on_register(self, username: str, auth_provider_type: str, auth_provider_id: str):
-        # username from callback will be fully qualified        
+        # Synapse awaits this callback before answering /login, so the LDAP
+        # lookups and room joins must not run inline or the client times out.
+        self.api_handler.run_as_background_process(
+            "ldap_rules_sync_rooms", self._sync_rooms, username
+        )
+
+    async def _sync_rooms(self, username: str):
+        # username from callback will be fully qualified
         localpart = username.split(":", 1)[0][1:]
-        logger.debug("'%s' just got registered, localpart '%s'", username, localpart)
+        logger.debug("'%s' just logged in, localpart '%s'", username, localpart)
 
         server = self._get_server()
         result, conn = await self._ldap_simple_bind(server, self.ldap_bind_dn, self.ldap_bind_password)
@@ -257,21 +268,27 @@ class LdapRules:
             logger.warning("LDAP bind failed for user '%s'", username)
             return
 
-        for group, mapping in self.room_mapping.items():
-            invite = mapping["invite"]
-            filter = mapping["filter"]
-            room_names = mapping["room_names"]
-            # Check whether user is in group ...
-            if await self._check_membership(conn, localpart, group, filter):
-                # ... on success we can iterate through rooms to join                
-                for room_name in room_names:
-                    room_id = await self._check_room_exist(room_name)
-                    if room_id is None:
-                        room_id = await self._create_the_room(room_name)
-                    if room_id:
-                        await self._join_to_room(self.inviter, username, room_id, invite)
-
-        await threads.deferToThread(conn.unbind)
+        try:
+            for group, mapping in self.room_mapping.items():
+                invite = mapping["invite"]
+                filter = mapping["filter"]
+                room_names = mapping["room_names"]
+                # Check whether user is in group ...
+                try:
+                    is_member = await self._check_membership(conn, localpart, group, filter)
+                except Exception as e:
+                    logger.warning("Membership check failed for '%s' in '%s': %s", localpart, group, e)
+                    continue
+                if is_member:
+                    # ... on success we can iterate through rooms to join
+                    for room_name in room_names:
+                        room_id = await self._check_room_exist(room_name)
+                        if room_id is None:
+                            room_id = await self._create_the_room(room_name)
+                        if room_id:
+                            await self._join_to_room(self.inviter, username, room_id, invite)
+        finally:
+            await self.api_handler.defer_to_thread(conn.unbind)
 
 def _require_keys(config: Dict[str, Any], required: Iterable[str]) -> None:
     missing = [key for key in required if key not in config]
