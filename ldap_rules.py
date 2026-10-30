@@ -70,6 +70,14 @@ class LdapRules:
         # Module callback for Synapse
         api.register_account_validity_callbacks(on_user_login=self.on_register)
 
+        # WARNING so it shows whatever the log config; tells which process loaded
+        # the module and whether the 'ldap_rules' logger level was applied.
+        logger.warning(
+            "ldap_rules %s loaded on worker '%s' (Synapse %s), effective log level: %s",
+            __version__, api.worker_name or "main", synapse.__version__,
+            logging.getLevelName(logger.getEffectiveLevel()),
+        )
+
     @staticmethod
     def parse_config(config) -> _Config:
         # verify config sanity
@@ -252,6 +260,7 @@ class LdapRules:
     async def on_register(self, username: str, auth_provider_type: str, auth_provider_id: str):
         # Synapse awaits this callback before answering /login, so the LDAP
         # lookups and room joins must not run inline or the client times out.
+        logger.info("on_user_login callback for '%s' (%s)", username, auth_provider_type)
         self.api_handler.run_as_background_process(
             "ldap_rules_sync_rooms", self._sync_rooms, username
         )
